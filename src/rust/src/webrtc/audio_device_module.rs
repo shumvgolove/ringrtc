@@ -161,7 +161,7 @@ pub enum DeviceInUse {
     SystemDefault,
     /// The unique ID of the preferred device.
     Device(String),
-    /// No device: none is preferred, or the preferred one is missing and fallback is disabled.
+    /// No device: the preferred one is missing and fallback is disabled.
     Unavailable,
 }
 
@@ -431,10 +431,7 @@ impl Worker {
                 DeviceType::Output => &worker.output_device_cache,
             };
             if device_id == SYSTEM_DEFAULT_DEVICE_ID {
-                return Some(AudioDevice {
-                    unique_id: SYSTEM_DEFAULT_DEVICE_ID.to_string(),
-                    name: String::new(),
-                });
+                return Some(system_default_device());
             }
             if let Some(info) = cache.iter().find(|d| d.device_id == device_id).cloned() {
                 return Some(AudioDevice {
@@ -1292,8 +1289,8 @@ impl Worker {
                     device_type: DeviceType::Output,
                     sender: sender.clone(),
                 },
-                preferred_playout_device: None,
-                preferred_recording_device: None,
+                preferred_playout_device: Some(system_default_device()),
+                preferred_recording_device: Some(system_default_device()),
                 playout_device: None,
                 recording_device: None,
                 output_stream: None,
@@ -1399,6 +1396,13 @@ impl Drop for AudioDeviceModule {
 /// changes of the OS default instead of staying on the device that was default when they started.
 pub const SYSTEM_DEFAULT_DEVICE_ID: &str = "";
 
+fn system_default_device() -> AudioDevice {
+    AudioDevice {
+        unique_id: SYSTEM_DEFAULT_DEVICE_ID.to_string(),
+        name: String::new(),
+    }
+}
+
 /// Arbitrary string to uniquely identify SimpleX for creating the cubeb object.
 const ADM_CONTEXT: &CStr = c"SimpleX";
 
@@ -1476,8 +1480,8 @@ impl AudioDeviceModule {
         let (started_sender, started_receiver) = mpsc::channel();
         let playout_delay = Arc::new(PlayoutDelayCache::default());
         let devices_in_use = Arc::new(DevicesInUse {
-            playout: Mutex::new(DeviceInUse::Unavailable),
-            recording: Mutex::new(DeviceInUse::Unavailable),
+            playout: Mutex::new(DeviceInUse::SystemDefault),
+            recording: Mutex::new(DeviceInUse::SystemDefault),
         });
         let cubeb_worker = Worker::spawn(
             started_sender,
