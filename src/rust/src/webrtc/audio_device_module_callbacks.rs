@@ -125,8 +125,8 @@ impl From<InternalFailure> for bool {
 macro_rules! adm_wrapper {
     () => {};
     ($f:ident($($param:ident: $arg_ty:ty),*) -> $ret:ty ; $($t:tt)*) => {
-        extern "C" fn $f(mut ptr: webrtc::ptr::Borrowed<Mutex<AudioDeviceModule>>, $($param: $arg_ty),*) -> $ret {
-            if let Some(mutex) = unsafe { ptr.as_mut() } {
+        extern "C" fn $f(ptr: webrtc::ptr::Borrowed<Mutex<AudioDeviceModule>>, $($param: $arg_ty),*) -> $ret {
+            if let Some(mutex) = unsafe { ptr.as_ref() } {
                 match mutex.lock() {
                     #[allow(unused_mut)]  // Some functions require mut; others don't.
                     Ok(mut adm) => adm.$f($($param),*),
