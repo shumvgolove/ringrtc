@@ -1155,6 +1155,13 @@ impl Worker {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     error!("Failed to initialize cubeb: {:?}", e);
+                    #[cfg(target_os = "windows")]
+                    {
+                        // Safety: No parameters, was already initialized.
+                        unsafe {
+                            Com::CoUninitialize();
+                        };
+                    }
                     if let Err(e) = started_signal.send(None) {
                         error!("Further, failed to notify about start failure: {}", e);
                     }
@@ -1195,6 +1202,8 @@ impl Worker {
             };
             if let Err(e) = worker.register_device_collection_changed(DeviceType::Input) {
                 error!("Failed to register input device callback: {}", e);
+                // Also uninitializes COM on Windows.
+                worker.terminate();
                 if let Err(e) = started_signal.send(None) {
                     error!("Further, failed to notify about start failure: {}", e);
                 }
@@ -1202,6 +1211,8 @@ impl Worker {
             }
             if let Err(e) = worker.register_device_collection_changed(DeviceType::Output) {
                 error!("Failed to register output device callback: {}", e);
+                // cubeb requires the input callback to be unregistered before the context drops.
+                worker.terminate();
                 if let Err(e) = started_signal.send(None) {
                     error!("Further, failed to notify about start failure: {}", e);
                 }
