@@ -145,6 +145,14 @@ impl Display for Event {
     }
 }
 
+/// The playout delay last measured by the worker, so that reading it never waits for the worker.
+#[derive(Debug, Default)]
+struct PlayoutDelayCache {
+    /// None when there is no output stream or its latency is unavailable.
+    ms: Mutex<Option<u16>>,
+    refresh_requested: AtomicBool,
+}
+
 #[derive(Debug, Clone)]
 struct UpdateCallbackData {
     device_type: DeviceType,
@@ -182,6 +190,7 @@ struct Worker {
     should_reinit_play: bool,
     should_reinit_record: bool,
     opaque_callback_data: Option<usize>,
+    playout_delay: Arc<PlayoutDelayCache>,
 }
 
 impl Worker {
@@ -546,6 +555,7 @@ impl Worker {
         }
         // Also drop the DeviceID - only save the AudioDevice
         self.playout_device = None;
+        *self.playout_delay.ms.lock().unwrap() = None;
         Ok(())
     }
 
@@ -813,11 +823,7 @@ impl Worker {
         }
     }
 
-    fn work(
-        &mut self,
-        receiver: mpsc::Receiver<Event>,
-        playout_delay_sender: mpsc::Sender<anyhow::Result<u16>>,
-    ) {
+    fn work(&mut self, receiver: mpsc::Receiver<Event>) {
         for received in receiver {
             let log_str = received.to_string();
             if let Err(e) = match received {
@@ -982,11 +988,12 @@ impl Worker {
                 }
                 Event::StopRecording => self.stop_recording(), // don't propagate to client; nothing they can do
                 Event::PlayoutDelay => {
-                    if let Err(e) = playout_delay_sender.send(self.playout_delay()) {
-                        Err(anyhow!("Failed to send playout delay: {}", e))
-                    } else {
-                        Ok(())
-                    }
+                    self.playout_delay
+                        .refresh_requested
+                        .store(false, Ordering::SeqCst);
+                    let delay = self.playout_delay();
+                    *self.playout_delay.ms.lock().unwrap() = delay.as_ref().ok().copied();
+                    delay.map(|_| ())
                 }
                 Event::Terminate => {
                     self.terminate();
@@ -1096,7 +1103,7 @@ impl Worker {
         started_signal: mpsc::Sender<Option<String>>,
         receiver: mpsc::Receiver<Event>,
         sender: mpsc::Sender<Event>,
-        playout_delay_sender: mpsc::Sender<anyhow::Result<u16>>,
+        playout_delay: Arc<PlayoutDelayCache>,
         input_device_names: Arc<Mutex<AudioDeviceList>>,
         output_device_names: Arc<Mutex<AudioDeviceList>>,
     ) -> JoinHandle<()> {
@@ -1158,6 +1165,7 @@ impl Worker {
                 should_reinit_play: false,
                 should_reinit_record: false,
                 opaque_callback_data: None,
+                playout_delay,
             };
             if let Err(e) = worker.register_device_collection_changed(DeviceType::Input) {
                 error!("Failed to register input device callback: {}", e);
@@ -1196,7 +1204,7 @@ impl Worker {
                 );
             }
 
-            worker.work(receiver, playout_delay_sender);
+            worker.work(receiver);
         })
     }
 }
@@ -1220,7 +1228,7 @@ pub struct AudioDeviceModule {
     // This is only an Option so that we can `take` out of it.
     cubeb_worker: Option<JoinHandle<()>>,
     mpsc_sender: mpsc::Sender<Event>,
-    playout_delay_receiver: mpsc::Receiver<anyhow::Result<u16>>,
+    playout_delay: Arc<PlayoutDelayCache>,
 }
 
 impl Drop for AudioDeviceModule {
@@ -1315,12 +1323,12 @@ impl AudioDeviceModule {
         let output_device_names = Arc::new(Mutex::new(AudioDeviceList::new_for_target_os()));
         let (sender, receiver) = mpsc::channel();
         let (started_sender, started_receiver) = mpsc::channel();
-        let (playout_delay_sender, playout_delay_receiver) = mpsc::channel();
+        let playout_delay = Arc::new(PlayoutDelayCache::default());
         let cubeb_worker = Worker::spawn(
             started_sender,
             receiver,
             sender.clone(),
-            playout_delay_sender,
+            playout_delay.clone(),
             input_device_names.clone(),
             output_device_names.clone(),
         );
@@ -1344,7 +1352,7 @@ impl AudioDeviceModule {
             attempted_recording_start: false,
             cubeb_worker: Some(cubeb_worker),
             mpsc_sender: sender,
-            playout_delay_receiver,
+            playout_delay,
         })
     }
 
@@ -1702,29 +1710,26 @@ impl AudioDeviceModule {
         -1
     }
 
+    // Called for every received audio packet with the module mutex held, so report the last
+    // measured delay and let the worker refresh it in the background.
     pub fn playout_delay(&self, delay_ms: webrtc::ptr::Borrowed<u16>) -> i32 {
-        if let Err(e) = self.mpsc_sender.send(Event::PlayoutDelay) {
-            error!("Failed to request PlayoutDelay: {}", e);
-            return -1;
-        }
-        // If we wait more than 50ms the delay probably won't be helpful anymore anyway.
-        match self
-            .playout_delay_receiver
-            .recv_timeout(Duration::from_millis(50))
-            .context("timed out trying to recv")
-            .flatten()
+        if !self
+            .playout_delay
+            .refresh_requested
+            .swap(true, Ordering::SeqCst)
+            && let Err(e) = self.mpsc_sender.send(Event::PlayoutDelay)
         {
-            Ok(latency_ms) => match write_to_null_or_valid_pointer(delay_ms, latency_ms) {
+            error!("Failed to request PlayoutDelay: {}", e);
+        }
+        match *self.playout_delay.ms.lock().unwrap() {
+            Some(latency_ms) => match write_to_null_or_valid_pointer(delay_ms, latency_ms) {
                 Ok(_) => 0,
                 Err(e) => {
                     error!("writing delay: {:?}", e);
                     -1
                 }
             },
-            Err(e) => {
-                error!("Failed to get latency: {}", e);
-                -1
-            }
+            None => -1,
         }
     }
 
