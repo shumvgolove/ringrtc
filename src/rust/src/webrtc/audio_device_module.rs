@@ -177,10 +177,13 @@ struct Worker {
     audio_device_observer: Option<Box<dyn AudioDeviceObserver>>,
     send_to_webrtc: Arc<AtomicBool>,
     // Has an attempt been made to init_{playing,recording} without a corresponding stop?
-    // Used to determine if we should try to re-initialize **and start** on a device swap
-    // (we always expect a Start to follow an Init)
+    // Used to determine if we should try to re-initialize on a device swap.
     should_reinit_play: bool,
     should_reinit_record: bool,
+    // Has an attempt been made to start_{playing,recording} without a corresponding stop? Only
+    // those streams are started again on a device swap: WebRTC may init long before it starts.
+    playout_started: bool,
+    recording_started: bool,
     opaque_callback_data: Option<usize>,
 }
 
@@ -539,6 +542,7 @@ impl Worker {
     }
 
     fn start_playout(&mut self) -> Result<(), AudioStartError> {
+        self.playout_started = true;
         if let Some(output_stream) = &self.output_stream {
             output_stream.start().map_err(AudioStartError::CubebError)
         } else {
@@ -548,6 +552,7 @@ impl Worker {
 
     fn stop_playout(&mut self) -> anyhow::Result<()> {
         self.should_reinit_play = false;
+        self.playout_started = false;
         if let Some(output_stream) = &self.output_stream {
             if let Err(e) = output_stream.stop() {
                 bail!("Failed to stop playout: {}", e);
@@ -564,6 +569,7 @@ impl Worker {
     // Can only fail if it fails to restart a stream.
     fn update_playout_device(&mut self, device: AudioDevice) -> anyhow::Result<()> {
         let should_reinit = self.should_reinit_play;
+        let was_started = self.playout_started;
         if should_reinit && let Err(e) = self.stop_playout() {
             info!(
                 "update_playout_device: failed to stop_playout: {e}. Likely the stream was not running."
@@ -574,7 +580,9 @@ impl Worker {
             // this will always set should_reinit_play, so if it fails and the
             // user selects a new device, we will still re-initialize
             self.init_playout()?;
-            self.start_playout()?;
+            if was_started {
+                self.start_playout()?;
+            }
         }
         Ok(())
     }
@@ -717,6 +725,7 @@ impl Worker {
     }
 
     fn start_recording(&mut self, send_to_webrtc: bool) -> Result<(), AudioStartError> {
+        self.recording_started = true;
         let was_sending = self.send_to_webrtc.swap(send_to_webrtc, Ordering::SeqCst);
         if !was_sending {
             // We were warming up; all we need to do is start sending to webrtc (or continue warmup).
@@ -731,6 +740,7 @@ impl Worker {
 
     fn stop_recording(&mut self) -> anyhow::Result<()> {
         self.should_reinit_record = false;
+        self.recording_started = false;
         if let Some(input_stream) = &self.input_stream {
             let res = input_stream.stop();
             // Reset **after** we stop recording to avoid sending data to webrtc incorrectly
@@ -750,6 +760,7 @@ impl Worker {
     // Can only fail if it fails to restart a stream.
     fn update_recording_device(&mut self, device: AudioDevice) -> anyhow::Result<()> {
         let should_reinit = self.should_reinit_record;
+        let was_started = self.recording_started;
         let was_sending_webrtc = self.send_to_webrtc.load(Ordering::SeqCst);
         if should_reinit && let Err(e) = self.stop_recording() {
             info!(
@@ -761,7 +772,9 @@ impl Worker {
             // this will always set should_reinit_record, so if it fails and the
             // user selects a new device, we will still re-initialize
             self.init_recording()?;
-            self.start_recording(was_sending_webrtc)?;
+            if was_started {
+                self.start_recording(was_sending_webrtc)?;
+            }
         }
         Ok(())
     }
@@ -1168,6 +1181,8 @@ impl Worker {
                 send_to_webrtc: Arc::new(AtomicBool::new(true)),
                 should_reinit_play: false,
                 should_reinit_record: false,
+                playout_started: false,
+                recording_started: false,
                 opaque_callback_data: None,
             };
             if let Err(e) = worker.register_device_collection_changed(DeviceType::Input) {
