@@ -33,7 +33,7 @@ use crate::{
     core::util::truncate_for_logging,
     webrtc,
     webrtc::{
-        audio_device_module_utils::{DeviceCollectionWrapper, do_cubeb_redactions},
+        audio_device_module_utils::{DeviceCollectionWrapper, do_cubeb_redactions, same_device},
         peer_connection_factory::{AudioDevice, AudioDeviceList, AudioDeviceObserver},
     },
 };
@@ -379,7 +379,10 @@ impl Worker {
                 if device.unique_id == SYSTEM_DEFAULT_DEVICE_ID {
                     return Some(std::ptr::null());
                 }
-                if let Some(device_info) = cache.iter().find(|d| d.device_id == device.unique_id) {
+                if let Some(device_info) = cache
+                    .iter()
+                    .find(|d| same_device(&d.device_id, &device.unique_id))
+                {
                     return Some(device_info.devid);
                 } else {
                     warn!(
@@ -413,7 +416,7 @@ impl Worker {
         query_device(self, device_type)
     }
 
-    /// Find an AudioDevice object for |device_id|, if any is connected.
+    /// Find an AudioDevice object for |device_id|; one that is not connected has no name.
     ///
     /// Refreshes the cache and retries once if the first attempt fails.
     fn find_audio_device_for(
@@ -433,7 +436,11 @@ impl Worker {
             if device_id == SYSTEM_DEFAULT_DEVICE_ID {
                 return Some(system_default_device());
             }
-            if let Some(info) = cache.iter().find(|d| d.device_id == device_id).cloned() {
+            if let Some(info) = cache
+                .iter()
+                .find(|d| same_device(&d.device_id, device_id))
+                .cloned()
+            {
                 return Some(AudioDevice {
                     unique_id: info.device_id.clone(),
                     name: info.friendly_name.clone(),
@@ -460,7 +467,12 @@ impl Worker {
         }
 
         // Try once more now that the cache is refreshed.
-        query_device(self, device_type, device_id)
+        query_device(self, device_type, device_id).or_else(|| {
+            Some(AudioDevice {
+                unique_id: device_id.to_string(),
+                name: String::new(),
+            })
+        })
     }
 
     fn init_playout(&mut self) -> anyhow::Result<()> {
@@ -849,7 +861,11 @@ impl Worker {
             Some(device) if device.unique_id == SYSTEM_DEFAULT_DEVICE_ID => {
                 DeviceInUse::SystemDefault
             }
-            Some(device) if cache.iter().any(|d| d.device_id == device.unique_id) => {
+            Some(device)
+                if cache
+                    .iter()
+                    .any(|d| same_device(&d.device_id, &device.unique_id)) =>
+            {
                 DeviceInUse::Device(device.unique_id.clone())
             }
             Some(_) if fallback => DeviceInUse::SystemDefault,

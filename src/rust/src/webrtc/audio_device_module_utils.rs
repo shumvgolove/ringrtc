@@ -18,6 +18,30 @@ use crate::{
     },
 };
 
+// kAdmMaxGuidSize in WebRTC's audio_device_defines.h.
+pub const ADM_MAX_GUID_SIZE: usize = 128;
+
+// FNV-1a 64-bit parameters, chosen because the hash must not change between builds.
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+const HASHED_DEVICE_ID_PREFIX: &str = "fnv1a:";
+
+/// The ID WebRTC gets for a device: an ID that does not fit its buffer becomes a stable hash.
+pub fn webrtc_device_id(unique_id: &str) -> Cow<'_, str> {
+    if unique_id.len() < ADM_MAX_GUID_SIZE {
+        return unique_id.into();
+    }
+    let hash = unique_id.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    });
+    format!("{HASHED_DEVICE_ID_PREFIX}{hash:016x}").into()
+}
+
+/// Whether two IDs name the same device, either of them possibly in its WebRTC form.
+pub fn same_device(a: &str, b: &str) -> bool {
+    webrtc_device_id(a) == webrtc_device_id(b)
+}
+
 type StaticRegex =
     regex_automata::dfa::regex::Regex<regex_automata::dfa::sparse::DFA<&'static [u8]>>;
 
@@ -690,6 +714,16 @@ mod audio_device_module_tests {
     #[test]
     fn cubeb_message_of_only_whitespace() {
         assert_eq!(do_cubeb_redactions("file.c:1: \n").unwrap(), "file.c:1: \n");
+    }
+
+    #[test]
+    fn webrtc_device_id_hashes_only_ids_that_do_not_fit() {
+        assert_eq!(webrtc_device_id("alsa_output.pci"), "alsa_output.pci");
+        let long = "x".repeat(200);
+        assert_eq!(webrtc_device_id(&long), "fnv1a:6ee14c8caecd5c45");
+        assert_eq!(webrtc_device_id(&long[..127]), &long[..127]);
+        assert!(same_device(&long, "fnv1a:6ee14c8caecd5c45"));
+        assert!(!same_device(&long[..128], &long));
     }
 
     #[test]
