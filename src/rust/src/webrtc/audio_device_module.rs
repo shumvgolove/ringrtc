@@ -338,6 +338,10 @@ impl Worker {
                 ),
             };
             if let Some(device) = device_pref {
+                // A null DeviceId makes cubeb follow the OS default device.
+                if device.unique_id == SYSTEM_DEFAULT_DEVICE_ID {
+                    return Some(std::ptr::null());
+                }
                 if let Some(device_info) = cache.iter().find(|d| d.device_id == device.unique_id) {
                     return Some(device_info.devid);
                 } else {
@@ -386,6 +390,12 @@ impl Worker {
                 DeviceType::Input => &worker.input_device_cache,
                 DeviceType::Output => &worker.output_device_cache,
             };
+            if device_id == SYSTEM_DEFAULT_DEVICE_ID {
+                return Some(AudioDevice {
+                    unique_id: SYSTEM_DEFAULT_DEVICE_ID.to_string(),
+                    name: String::new(),
+                });
+            }
             if let Some(info) = cache.iter().find(|d| d.device_id == device_id).cloned() {
                 return Some(AudioDevice {
                     unique_id: info.device_id.clone(),
@@ -1235,6 +1245,10 @@ impl Drop for AudioDeviceModule {
     }
 }
 
+/// Device ID that selects the system default device. Streams opened on it follow
+/// changes of the OS default instead of staying on the device that was default when they started.
+pub const SYSTEM_DEFAULT_DEVICE_ID: &str = "";
+
 /// Arbitrary string to uniquely identify ringrtc for creating the cubeb object.
 const ADM_CONTEXT: &CStr = c"ringrtc";
 
@@ -1802,11 +1816,33 @@ impl AudioDeviceModule {
 
 #[cfg(test)]
 mod audio_device_module_tests {
+    use std::{sync::mpsc, time::Duration};
+
     use cubeb::Context;
 
     use crate::webrtc::{
-        audio_device_module::AudioDeviceModule, audio_device_module_utils::DeviceCollectionWrapper,
+        audio_device_module::{AudioDeviceModule, SYSTEM_DEFAULT_DEVICE_ID},
+        audio_device_module_utils::DeviceCollectionWrapper,
+        peer_connection_factory::{AudioDevice, AudioDeviceList, AudioDeviceObserver},
     };
+
+    #[derive(Debug)]
+    struct PromiseObserver(mpsc::Sender<(bool, Option<AudioDevice>, u32)>);
+
+    impl AudioDeviceObserver for PromiseObserver {
+        fn output_changed(&self, _devices: AudioDeviceList) {}
+        fn input_changed(&self, _devices: AudioDeviceList) {}
+        fn settle_promise(
+            &self,
+            success: bool,
+            audio_device: Option<AudioDevice>,
+            request_id: u32,
+        ) {
+            self.0.send((success, audio_device, request_id)).unwrap();
+        }
+        fn settle_start_recording_via_callback(&self, _: bool, _: Option<AudioDevice>) {}
+        fn settle_start_playback_via_callback(&self, _: bool, _: Option<AudioDevice>) {}
+    }
 
     #[test]
     fn init_backend_id() {
@@ -1845,5 +1881,31 @@ mod audio_device_module_tests {
         };
         assert_eq!(playout, listed(cubeb::DeviceType::OUTPUT));
         assert_eq!(recording, listed(cubeb::DeviceType::INPUT));
+    }
+
+    #[test]
+    fn set_system_default_device() {
+        let (sender, settled) = mpsc::channel();
+        let mut adm = AudioDeviceModule::new().unwrap();
+        adm.register_audio_device_callback(Box::new(PromiseObserver(sender)))
+            .unwrap();
+        adm.set_playout_device_by_id(SYSTEM_DEFAULT_DEVICE_ID, 1)
+            .unwrap();
+        adm.set_recording_device_by_id(SYSTEM_DEFAULT_DEVICE_ID, 2)
+            .unwrap();
+
+        let system_default = Some(AudioDevice {
+            name: String::new(),
+            unique_id: SYSTEM_DEFAULT_DEVICE_ID.to_string(),
+        });
+        let timeout = Duration::from_secs(5);
+        assert_eq!(
+            settled.recv_timeout(timeout).unwrap(),
+            (true, system_default.clone(), 1)
+        );
+        assert_eq!(
+            settled.recv_timeout(timeout).unwrap(),
+            (true, system_default, 2)
+        );
     }
 }
