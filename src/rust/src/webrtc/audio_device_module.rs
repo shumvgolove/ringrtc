@@ -117,6 +117,7 @@ enum Event {
     RegisterAudioObserver(Box<dyn AudioDeviceObserver>),
     SetCallbackIndirect(usize),
     SetFallback(DeviceType, bool),
+    Flush(mpsc::Sender<()>),
 }
 
 // Print the enum branch without the associated data for logging.
@@ -142,6 +143,7 @@ impl Display for Event {
                 Event::RegisterAudioObserver(_) => "RegisterAudioObserver",
                 Event::SetCallbackIndirect(_) => "SetCallbackIndirect",
                 Event::SetFallback(..) => "SetFallback",
+                Event::Flush(_) => "Flush",
             }
         )
     }
@@ -1148,6 +1150,9 @@ impl Worker {
                     self.opaque_callback_data = Some(opaque_callback_data);
                     Ok(())
                 }
+                Event::Flush(flushed) => flushed
+                    .send(())
+                    .map_err(|e| anyhow!("Failed to confirm Flush: {}", e)),
                 Event::SetFallback(device_type, enabled) => {
                     match device_type {
                         DeviceType::Input => self.recording_fallback = enabled,
@@ -2003,6 +2008,16 @@ impl AudioDeviceModule {
     /// As `set_playout_fallback`, for recording.
     pub fn set_recording_fallback(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.set_fallback(DeviceType::Input, enabled)
+    }
+
+    /// Returns a receiver that gets a message once the worker has handled all earlier requests.
+    /// Wait on it without holding a lock that an observer callback may take.
+    pub fn flush(&self) -> anyhow::Result<mpsc::Receiver<()>> {
+        let (flushed_sender, flushed) = mpsc::channel();
+        if let Err(e) = self.mpsc_sender.send(Event::Flush(flushed_sender)) {
+            bail!("Failed to request Flush: {}", e);
+        }
+        Ok(flushed)
     }
 
     fn set_fallback(&mut self, device_type: DeviceType, enabled: bool) -> anyhow::Result<()> {
