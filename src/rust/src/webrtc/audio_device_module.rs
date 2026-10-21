@@ -116,6 +116,7 @@ enum Event {
     Terminate,
     RegisterAudioObserver(Box<dyn AudioDeviceObserver>),
     SetCallbackIndirect(usize),
+    SetFallback(DeviceType, bool),
 }
 
 // Print the enum branch without the associated data for logging.
@@ -140,6 +141,7 @@ impl Display for Event {
                 Event::Terminate => "Terminate",
                 Event::RegisterAudioObserver(_) => "RegisterAudioObserver",
                 Event::SetCallbackIndirect(_) => "SetCallbackIndirect",
+                Event::SetFallback(..) => "SetFallback",
             }
         )
     }
@@ -151,6 +153,23 @@ struct PlayoutDelayCache {
     /// None when there is no output stream or its latency is unavailable.
     ms: Mutex<Option<u16>>,
     refresh_requested: AtomicBool,
+}
+
+/// The device a direction uses: the preferred one, or what replaces it while it is missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceInUse {
+    SystemDefault,
+    /// The unique ID of the preferred device.
+    Device(String),
+    /// No device: none is preferred, or the preferred one is missing and fallback is disabled.
+    Unavailable,
+}
+
+/// The devices in use, published by the worker for reading without waiting for it.
+#[derive(Debug)]
+struct DevicesInUse {
+    playout: Mutex<DeviceInUse>,
+    recording: Mutex<DeviceInUse>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +213,10 @@ struct Worker {
     recording_started: bool,
     opaque_callback_data: Option<usize>,
     playout_delay: Arc<PlayoutDelayCache>,
+    // Whether a direction uses the system default while its preferred device is missing.
+    playout_fallback: bool,
+    recording_fallback: bool,
+    devices_in_use: Arc<DevicesInUse>,
 }
 
 impl Worker {
@@ -339,14 +362,16 @@ impl Worker {
     /// Refreshes the cache and retries once if the first attempt fails.
     fn preferred_devid_for(&mut self, device_type: DeviceType) -> Option<DeviceId> {
         fn query_device(worker: &Worker, device_type: DeviceType) -> Option<DeviceId> {
-            let (cache, device_pref) = match device_type {
+            let (cache, device_pref, fallback) = match device_type {
                 DeviceType::Input => (
                     &worker.input_device_cache,
                     &worker.preferred_recording_device,
+                    worker.recording_fallback,
                 ),
                 DeviceType::Output => (
                     &worker.output_device_cache,
                     &worker.preferred_playout_device,
+                    worker.playout_fallback,
                 ),
             };
             if let Some(device) = device_pref {
@@ -360,6 +385,9 @@ impl Worker {
                     warn!(
                         "Saved user preference for {device_type:?} {device:?} does not correspond to a currently-known device",
                     );
+                    if fallback {
+                        return Some(std::ptr::null());
+                    }
                 }
             } else {
                 warn!(
@@ -562,6 +590,11 @@ impl Worker {
     fn stop_playout(&mut self) -> anyhow::Result<()> {
         self.should_reinit_play = false;
         self.playout_started = false;
+        self.close_playout()
+    }
+
+    /// Closes the stream but keeps WebRTC's init and start state.
+    fn close_playout(&mut self) -> anyhow::Result<()> {
         if let Some(output_stream) = &self.output_stream {
             if let Err(e) = output_stream.stop() {
                 bail!("Failed to stop playout: {}", e);
@@ -575,17 +608,21 @@ impl Worker {
         Ok(())
     }
 
-    // Update the playout device, stopping and resuming playout if needed.
-    // Can only fail if it fails to restart a stream.
     fn update_playout_device(&mut self, device: AudioDevice) -> anyhow::Result<()> {
+        self.preferred_playout_device = Some(device);
+        self.follow_device_in_use(DeviceType::Output)
+    }
+
+    // Reopen the stream on the device in use, restarting it if needed.
+    // Can only fail if it fails to restart a stream.
+    fn reopen_playout(&mut self) -> anyhow::Result<()> {
         let should_reinit = self.should_reinit_play;
         let was_started = self.playout_started;
-        if should_reinit && let Err(e) = self.stop_playout() {
+        if should_reinit && let Err(e) = self.close_playout() {
             info!(
-                "update_playout_device: failed to stop_playout: {e}. Likely the stream was not running."
+                "reopen_playout: failed to close_playout: {e}. Likely the stream was not running."
             );
         }
-        self.preferred_playout_device = Some(device);
         if should_reinit {
             // this will always set should_reinit_play, so if it fails and the
             // user selects a new device, we will still re-initialize
@@ -751,6 +788,11 @@ impl Worker {
     fn stop_recording(&mut self) -> anyhow::Result<()> {
         self.should_reinit_record = false;
         self.recording_started = false;
+        self.close_recording()
+    }
+
+    /// Closes the stream but keeps WebRTC's init and start state.
+    fn close_recording(&mut self) -> anyhow::Result<()> {
         if let Some(input_stream) = &self.input_stream {
             let res = input_stream.stop();
             // Reset **after** we stop recording to avoid sending data to webrtc incorrectly
@@ -766,18 +808,22 @@ impl Worker {
         Ok(())
     }
 
-    // Update the recording device, stopping and resuming recording if needed.
-    // Can only fail if it fails to restart a stream.
     fn update_recording_device(&mut self, device: AudioDevice) -> anyhow::Result<()> {
+        self.preferred_recording_device = Some(device);
+        self.follow_device_in_use(DeviceType::Input)
+    }
+
+    // Reopen the stream on the device in use, restarting it if needed.
+    // Can only fail if it fails to restart a stream.
+    fn reopen_recording(&mut self) -> anyhow::Result<()> {
         let should_reinit = self.should_reinit_record;
         let was_started = self.recording_started;
         let was_sending_webrtc = self.send_to_webrtc.load(Ordering::SeqCst);
-        if should_reinit && let Err(e) = self.stop_recording() {
+        if should_reinit && let Err(e) = self.close_recording() {
             info!(
-                "update_recording_device: failed to stop_recording: {e}. Likely the stream was not running."
+                "reopen_recording: failed to close_recording: {e}. Likely the stream was not running."
             );
         }
-        self.preferred_recording_device = Some(device);
         if should_reinit {
             // this will always set should_reinit_record, so if it fails and the
             // user selects a new device, we will still re-initialize
@@ -789,14 +835,70 @@ impl Worker {
         Ok(())
     }
 
+    fn device_in_use(&self, device_type: DeviceType) -> DeviceInUse {
+        let (cache, preferred, fallback) = match device_type {
+            DeviceType::Input => (
+                &self.input_device_cache,
+                &self.preferred_recording_device,
+                self.recording_fallback,
+            ),
+            DeviceType::Output => (
+                &self.output_device_cache,
+                &self.preferred_playout_device,
+                self.playout_fallback,
+            ),
+        };
+        match preferred {
+            Some(device) if device.unique_id == SYSTEM_DEFAULT_DEVICE_ID => {
+                DeviceInUse::SystemDefault
+            }
+            Some(device) if cache.iter().any(|d| d.device_id == device.unique_id) => {
+                DeviceInUse::Device(device.unique_id.clone())
+            }
+            Some(_) if fallback => DeviceInUse::SystemDefault,
+            _ => DeviceInUse::Unavailable,
+        }
+    }
+
+    /// Publishes the device in use and, when it changed, notifies the observer and moves an
+    /// initialized stream to it.
+    fn follow_device_in_use(&mut self, device_type: DeviceType) -> anyhow::Result<()> {
+        let in_use = self.device_in_use(device_type);
+        {
+            let mut published = match device_type {
+                DeviceType::Input => self.devices_in_use.recording.lock().unwrap(),
+                DeviceType::Output => self.devices_in_use.playout.lock().unwrap(),
+            };
+            if *published == in_use {
+                return Ok(());
+            }
+            info!("{device_type:?} device in use: {in_use:?}");
+            *published = in_use;
+        }
+        if let Some(ado) = &self.audio_device_observer {
+            match device_type {
+                DeviceType::Input => {
+                    ado.input_changed(self.input_device_names.lock().unwrap().clone())
+                }
+                DeviceType::Output => {
+                    ado.output_changed(self.output_device_names.lock().unwrap().clone())
+                }
+            }
+        }
+        match device_type {
+            DeviceType::Input => self.reopen_recording(),
+            DeviceType::Output => self.reopen_playout(),
+        }
+    }
+
     fn set_input_processing_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
         if enabled == self.voice_processing_enabled {
             return Ok(());
         }
         self.voice_processing_enabled = enabled;
 
-        if let Some(device) = self.preferred_recording_device.clone() {
-            self.update_recording_device(device)
+        if self.preferred_recording_device.is_some() {
+            self.reopen_recording()
         } else {
             Ok(())
         }
@@ -851,7 +953,9 @@ impl Worker {
         for received in receiver {
             let log_str = received.to_string();
             if let Err(e) = match received {
-                Event::RefreshCache(d) => self.refresh_device_cache(d),
+                Event::RefreshCache(d) => self
+                    .refresh_device_cache(d)
+                    .and_then(|()| self.follow_device_in_use(d)),
                 Event::SetPlayoutDevice { device, request_id } => {
                     match self.find_audio_device_for(DeviceType::Output, &device) {
                         None => {
@@ -1031,6 +1135,13 @@ impl Worker {
                     self.opaque_callback_data = Some(opaque_callback_data);
                     Ok(())
                 }
+                Event::SetFallback(device_type, enabled) => {
+                    match device_type {
+                        DeviceType::Input => self.recording_fallback = enabled,
+                        DeviceType::Output => self.playout_fallback = enabled,
+                    }
+                    self.follow_device_in_use(device_type)
+                }
             } {
                 warn!("{} failed: {:?}", log_str, e);
             }
@@ -1130,6 +1241,7 @@ impl Worker {
         playout_delay: Arc<PlayoutDelayCache>,
         input_device_names: Arc<Mutex<AudioDeviceList>>,
         output_device_names: Arc<Mutex<AudioDeviceList>>,
+        devices_in_use: Arc<DevicesInUse>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             #[cfg(target_os = "windows")]
@@ -1199,6 +1311,9 @@ impl Worker {
                 recording_started: false,
                 opaque_callback_data: None,
                 playout_delay,
+                playout_fallback: true,
+                recording_fallback: true,
+                devices_in_use,
             };
             if let Err(e) = worker.register_device_collection_changed(DeviceType::Input) {
                 error!("Failed to register input device callback: {}", e);
@@ -1260,6 +1375,7 @@ pub struct AudioDeviceModule {
     cubeb_worker: Option<JoinHandle<()>>,
     mpsc_sender: mpsc::Sender<Event>,
     playout_delay: Arc<PlayoutDelayCache>,
+    devices_in_use: Arc<DevicesInUse>,
 }
 
 impl Drop for AudioDeviceModule {
@@ -1359,6 +1475,10 @@ impl AudioDeviceModule {
         let (sender, receiver) = mpsc::channel();
         let (started_sender, started_receiver) = mpsc::channel();
         let playout_delay = Arc::new(PlayoutDelayCache::default());
+        let devices_in_use = Arc::new(DevicesInUse {
+            playout: Mutex::new(DeviceInUse::Unavailable),
+            recording: Mutex::new(DeviceInUse::Unavailable),
+        });
         let cubeb_worker = Worker::spawn(
             started_sender,
             receiver,
@@ -1366,6 +1486,7 @@ impl AudioDeviceModule {
             playout_delay.clone(),
             input_device_names.clone(),
             output_device_names.clone(),
+            devices_in_use.clone(),
         );
 
         // Ensure the thread started correctly
@@ -1388,6 +1509,7 @@ impl AudioDeviceModule {
             cubeb_worker: Some(cubeb_worker),
             mpsc_sender: sender,
             playout_delay,
+            devices_in_use,
         })
     }
 
@@ -1840,6 +1962,35 @@ impl AudioDeviceModule {
             .send(Event::SetInputProcessing(enabled, request_id))
         {
             return Err(anyhow!("Failed to request SetInputProcessing: {}", e));
+        }
+        Ok(())
+    }
+
+    pub fn playout_device_in_use(&self) -> DeviceInUse {
+        self.devices_in_use.playout.lock().unwrap().clone()
+    }
+
+    pub fn recording_device_in_use(&self) -> DeviceInUse {
+        self.devices_in_use.recording.lock().unwrap().clone()
+    }
+
+    /// Whether playout uses the system default while the selected device is missing (the
+    /// default) or stays closed until it returns or another device is selected.
+    pub fn set_playout_fallback(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.set_fallback(DeviceType::Output, enabled)
+    }
+
+    /// As `set_playout_fallback`, for recording.
+    pub fn set_recording_fallback(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.set_fallback(DeviceType::Input, enabled)
+    }
+
+    fn set_fallback(&mut self, device_type: DeviceType, enabled: bool) -> anyhow::Result<()> {
+        if let Err(e) = self
+            .mpsc_sender
+            .send(Event::SetFallback(device_type, enabled))
+        {
+            bail!("Failed to request SetFallback: {}", e);
         }
         Ok(())
     }
