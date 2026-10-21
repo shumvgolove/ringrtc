@@ -213,20 +213,21 @@ impl Worker {
 
         let names = collection.extract_names();
 
+        // Update the names first so that an observer that enumerates devices sees the new list.
         match device_type {
             DeviceType::Input => {
-                if let Some(ado) = &self.audio_device_observer {
-                    ado.input_changed(names.clone());
-                }
                 self.input_device_cache = collection;
-                *self.input_device_names.lock().unwrap() = names;
+                *self.input_device_names.lock().unwrap() = names.clone();
+                if let Some(ado) = &self.audio_device_observer {
+                    ado.input_changed(names);
+                }
             }
             DeviceType::Output => {
-                if let Some(ado) = &self.audio_device_observer {
-                    ado.output_changed(names.clone());
-                }
                 self.output_device_cache = collection;
-                *self.output_device_names.lock().unwrap() = names;
+                *self.output_device_names.lock().unwrap() = names.clone();
+                if let Some(ado) = &self.audio_device_observer {
+                    ado.output_changed(names);
+                }
             }
         }
         Ok(())
