@@ -349,7 +349,8 @@ pub fn do_cubeb_redactions(text: &str) -> Option<String> {
     let ending_whitespace_re = regex_aot::regex!(r"\s*$");
     let ending_whitespace_start = ending_whitespace_re
         .find(text)
-        .map_or(text.len(), |m| m.start());
+        .map_or(text.len(), |m| m.start())
+        .max(ident_match.end());
     let ending_whitespace = if ending_whitespace_start == text.len() {
         ""
     } else {
@@ -684,6 +685,11 @@ mod audio_device_module_tests {
             "description=Ry...er, driver=PipeWire, latency=0"
             )
         );
+    }
+
+    #[test]
+    fn cubeb_message_of_only_whitespace() {
+        assert_eq!(do_cubeb_redactions("file.c:1: \n").unwrap(), "file.c:1: \n");
     }
 
     #[test]
