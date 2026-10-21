@@ -470,7 +470,7 @@ impl Worker {
         };
         buffer.reserve(WEBRTC_WINDOW);
         builder
-            .name("ringrtc output")
+            .name("SimpleX output")
             .output(out_device, &params)
             .latency(std::cmp::max(SAMPLE_LATENCY, min_latency))
             .data_callback(move |_, output| {
@@ -643,7 +643,7 @@ impl Worker {
         };
         buffer.reserve(WEBRTC_WINDOW);
         builder
-            .name("ringrtc input")
+            .name("SimpleX input")
             .input(recording_device, &params)
             .latency(std::cmp::max(SAMPLE_LATENCY, min_latency))
             .data_callback(move |input, _| {
@@ -1283,8 +1283,8 @@ impl Drop for AudioDeviceModule {
 /// changes of the OS default instead of staying on the device that was default when they started.
 pub const SYSTEM_DEFAULT_DEVICE_ID: &str = "";
 
-/// Arbitrary string to uniquely identify ringrtc for creating the cubeb object.
-const ADM_CONTEXT: &CStr = c"ringrtc";
+/// Arbitrary string to uniquely identify SimpleX for creating the cubeb object.
+const ADM_CONTEXT: &CStr = c"SimpleX";
 
 const SAMPLE_FREQUENCY: u32 = 48_000;
 // Target sample latency. The actual sample latency will
