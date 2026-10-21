@@ -1176,17 +1176,11 @@ impl Worker {
 
             // Refresh both caches before we signal a successful start so that callers can
             // immediately enumerate devices.
-            if let Err(e) = sender.send(Event::RefreshCache(DeviceType::Input)) {
-                error!("Failed to request initial input device refresh: {}", e);
-                if let Err(e) = started_signal.send(None) {
-                    error!("Further, failed to notify about start failure: {}", e);
-                }
+            if let Err(e) = worker.refresh_device_cache(DeviceType::Input) {
+                error!("Failed initial input device refresh: {}", e);
             }
-            if let Err(e) = sender.send(Event::RefreshCache(DeviceType::Output)) {
-                error!("Failed to request initial output device refresh: {}", e);
-                if let Err(e) = started_signal.send(None) {
-                    error!("Further, failed to notify about start failure: {}", e);
-                }
+            if let Err(e) = worker.refresh_device_cache(DeviceType::Output) {
+                error!("Failed initial output device refresh: {}", e);
             }
 
             if let Err(e) = started_signal.send(Some(name)) {
@@ -1807,7 +1801,11 @@ impl AudioDeviceModule {
 
 #[cfg(test)]
 mod audio_device_module_tests {
-    use crate::webrtc::audio_device_module::AudioDeviceModule;
+    use cubeb::Context;
+
+    use crate::webrtc::{
+        audio_device_module::AudioDeviceModule, audio_device_module_utils::DeviceCollectionWrapper,
+    };
 
     #[test]
     fn init_backend_id() {
@@ -1818,14 +1816,33 @@ mod audio_device_module_tests {
         #[cfg(target_os = "linux")]
         let expected_backend = "pulse-rust";
 
-        cubeb_core::set_logging(
+        // Tests run concurrently; cubeb keeps the log callback of an ADM another test created first.
+        match cubeb_core::set_logging(
             cubeb_core::LogLevel::Normal,
             Some(|cstr| println!("{:?}", cstr)),
-        )
-        .expect("failed to set logging");
+        ) {
+            Ok(()) | Err(cubeb_core::Error::NotSupported) => {}
+            Err(e) => panic!("failed to set logging: {e}"),
+        }
         let mut adm = AudioDeviceModule::new().unwrap();
         assert_eq!(adm.init(0), 0);
 
         assert_eq!(adm.backend_name(), expected_backend.to_string());
+    }
+
+    #[test]
+    fn devices_listed_when_new_returns() {
+        let mut adm = AudioDeviceModule::new().unwrap();
+        // Read right away, before a refresh queued on the worker thread could have run.
+        let playout = adm.get_audio_playout_devices().unwrap();
+        let recording = adm.get_audio_recording_devices().unwrap();
+
+        let ctx = Context::init(Some(c"ringrtc-test"), None).unwrap();
+        let listed = |device_type| {
+            DeviceCollectionWrapper::new(&ctx.enumerate_devices(device_type).unwrap())
+                .extract_names()
+        };
+        assert_eq!(playout, listed(cubeb::DeviceType::OUTPUT));
+        assert_eq!(recording, listed(cubeb::DeviceType::INPUT));
     }
 }
