@@ -251,18 +251,23 @@ impl Worker {
         let names = collection.extract_names();
 
         // Update the names first so that an observer that enumerates devices sees the new list.
+        // When the device in use changes too, follow_device_in_use notifies once it is published.
         match device_type {
             DeviceType::Input => {
                 self.input_device_cache = collection;
                 *self.input_device_names.lock().unwrap() = names.clone();
-                if let Some(ado) = &self.audio_device_observer {
+                if let Some(ado) = &self.audio_device_observer
+                    && self.device_in_use_published(device_type)
+                {
                     ado.input_changed(names);
                 }
             }
             DeviceType::Output => {
                 self.output_device_cache = collection;
                 *self.output_device_names.lock().unwrap() = names.clone();
-                if let Some(ado) = &self.audio_device_observer {
+                if let Some(ado) = &self.audio_device_observer
+                    && self.device_in_use_published(device_type)
+                {
                     ado.output_changed(names);
                 }
             }
@@ -877,6 +882,14 @@ impl Worker {
 
     /// Publishes the device in use and, when it changed, notifies the observer and moves an
     /// initialized stream to it.
+    fn device_in_use_published(&self, device_type: DeviceType) -> bool {
+        let published = match device_type {
+            DeviceType::Input => &self.devices_in_use.recording,
+            DeviceType::Output => &self.devices_in_use.playout,
+        };
+        *published.lock().unwrap() == self.device_in_use(device_type)
+    }
+
     fn follow_device_in_use(&mut self, device_type: DeviceType) -> anyhow::Result<()> {
         let in_use = self.device_in_use(device_type);
         {
