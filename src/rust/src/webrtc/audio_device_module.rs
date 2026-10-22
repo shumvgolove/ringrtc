@@ -891,12 +891,15 @@ impl Worker {
             *published = in_use;
         }
         if let Some(ado) = &self.audio_device_observer {
+            // Release the names before calling out: the observer may enumerate devices.
             match device_type {
                 DeviceType::Input => {
-                    ado.input_changed(self.input_device_names.lock().unwrap().clone())
+                    let names = self.input_device_names.lock().unwrap().clone();
+                    ado.input_changed(names)
                 }
                 DeviceType::Output => {
-                    ado.output_changed(self.output_device_names.lock().unwrap().clone())
+                    let names = self.output_device_names.lock().unwrap().clone();
+                    ado.output_changed(names)
                 }
             }
         }
